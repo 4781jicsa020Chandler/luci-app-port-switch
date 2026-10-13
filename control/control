@@ -1,0 +1,10 @@
+Package: luci-app-port-switch
+Version: 1.0.0
+Architecture: all
+Maintainer: Local router administrator
+Section: luci
+Priority: optional
+Depends: luci-base, jshn, jsonfilter, uci
+Description: WAN/LAN port switching for GL-MT3000
+ A small authenticated LuCI page to swap or restore Ethernet port roles,
+ with network backups, a confirmation window and automatic rollback.

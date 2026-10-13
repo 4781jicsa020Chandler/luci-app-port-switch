@@ -1,0 +1,32 @@
+name: Build package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check shell syntax
+        run: |
+          sh -n root/usr/libexec/port-switch
+          sh -n root/etc/init.d/port-switch
+          sh -n control/postinst
+          sh -n control/prerm
+      - name: Build installer
+        run: python3 build.py
+      - name: Verify package contents
+        run: python3 -m unittest discover -s tests -v
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: luci-app-port-switch
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

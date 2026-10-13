@@ -1,0 +1,23 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+# GL.iNet's nginx sends /ubus/ to its own UI. Use LuCI's authenticated CGI
+# transport when LuCI is still configured with that default endpoint.
+if [ -f /etc/nginx/conf.d/gl.conf ]; then
+    case "$(uci -q get luci.main.ubuspath)" in
+        /ubus|/ubus/)
+            [ -z "$(uci -q changes luci)" ] || exit 1
+            umask 077
+            mkdir -p /etc/port-switch || exit 1
+            chmod 700 /etc/port-switch || exit 1
+            if [ ! -e /etc/port-switch/luci-before-port-switch ]; then
+                cp /etc/config/luci /etc/port-switch/luci-before-port-switch || exit 1
+            fi
+            uci set luci.main.ubuspath='/cgi-bin/luci/admin/ubus' || exit 1
+            uci commit luci || exit 1
+            ;;
+    esac
+fi
+rm -f /tmp/luci-indexcache
+rm -rf /tmp/luci-modulecache
+/etc/init.d/port-switch enable || exit 1
+exit 0

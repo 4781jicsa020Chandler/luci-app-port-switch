@@ -1,0 +1,582 @@
+#!/bin/sh
+# GL-MT3000 Ethernet role switcher. Run as root through the authenticated LuCI
+# controller. Only /etc/config/network is changed; credentials are never read.
+set -f
+umask 077
+
+SELF=/usr/libexec/port-switch
+STATE=/etc/port-switch
+BACKUPS=/etc/port-switch/backups
+PENDING=/etc/port-switch/pending
+LOCK=/tmp/port-switch.lock
+NETWORK=/etc/config/network
+SYS_NET=/sys/class/net
+MODEL_FILE=/proc/gl-hw-info/model
+SYSINFO_MODEL=/tmp/sysinfo/model
+UPTIME_FILE=/proc/uptime
+GL_VERSION=/etc/glversion
+JSHN=/usr/share/libubox/jshn.sh
+NETWORK_INIT=/etc/init.d/network
+ROLLBACK_SECONDS=120
+HOLD_LOCK=0
+
+if [ ! -r "$JSHN" ]; then
+    printf '%s\n' '{"ok":false,"error":"The router is missing its JSON helper. Install the jshn package first."}'
+    exit 1
+fi
+. "$JSHN"
+
+fail() {
+    json_init
+    json_add_boolean ok 0
+    json_add_string error "$1"
+    json_dump
+    exit 1
+}
+
+release_lock() {
+    if [ "$HOLD_LOCK" = 1 ]; then
+        rm -f "$LOCK/pid"
+        rmdir "$LOCK" 2>/dev/null
+        HOLD_LOCK=0
+    fi
+}
+trap release_lock 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+valid_token() {
+    [ "${#1}" = 32 ] || return 1
+    case "$1" in *[!0-9a-f]*|'') return 1 ;; esac
+}
+
+valid_backup() {
+    [ "${#1}" = 25 ] || return 1
+    printf '%s\n' "$1" | grep -q '^[0-9]\{8\}T[0-9]\{6\}Z-[0-9a-f]\{8\}$'
+}
+
+read_file() { [ -f "$1" ] && [ ! -L "$1" ] && cat "$1" 2>/dev/null; }
+token_matches() { valid_token "$1" && [ "$(read_file "$PENDING/token")" = "$1" ]; }
+
+acquire_lock() {
+    local tries=0 lock_pid missing=0 max_tries="${1:-12}"
+    [ ! -L "$LOCK" ] || fail 'The temporary lock is unsafe. Remove /tmp/port-switch.lock and try again.'
+    while ! mkdir "$LOCK" 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -lt "$max_tries" ] || fail 'Another port change is in progress. Please try again in a moment.'
+        lock_pid=$(read_file "$LOCK/pid")
+        case "$lock_pid" in
+            ''|*[!0-9]*)
+                missing=$((missing + 1))
+                if [ "$missing" -ge 4 ]; then
+                    rm -f "$LOCK/pid"
+                    rmdir "$LOCK" 2>/dev/null
+                fi
+                ;;
+            *)
+                if ! kill -0 "$lock_pid" 2>/dev/null; then
+                    rm -f "$LOCK/pid"
+                    rmdir "$LOCK" 2>/dev/null
+                fi
+                ;;
+        esac
+        sleep 1
+    done
+    HOLD_LOCK=1
+    printf '%s\n' "$$" > "$LOCK/pid" || fail 'The temporary lock could not be created.'
+}
+
+prepare_state() {
+    [ ! -L "$STATE" ] && [ ! -L "$BACKUPS" ] && [ ! -L "$PENDING" ] || fail 'The backup directory is unsafe.'
+    mkdir -p "$BACKUPS" || fail 'The backup directory could not be created.'
+    chmod 700 "$STATE" "$BACKUPS" || fail 'The backup directory could not be secured.'
+}
+
+check_model() {
+    local raw_model="$1"
+    [ "$(id -u)" = 0 ] || fail 'This tool must be run by the router administrator.'
+    case "$(printf '%s' "$raw_model" | tr 'A-Z' 'a-z' | tr -d ' \r\n')" in
+        mt3000|gl-mt3000|gl.inetgl-mt3000|gl.inetglmt3000) MODEL=GL-MT3000 ;;
+        *) fail 'This application supports the GL-MT3000 (Beryl AX) only. No settings were changed.' ;;
+    esac
+}
+
+check_router() {
+    local raw_model board
+    board=$(ubus -t 3 call system board 2>/dev/null)
+    raw_model=$(read_file "$MODEL_FILE")
+    [ -n "$raw_model" ] || raw_model=$(read_file "$SYSINFO_MODEL")
+    [ -n "$raw_model" ] || raw_model=$(jsonfilter -s "$board" -e '@.model' 2>/dev/null)
+    check_model "$raw_model"
+    FIRMWARE=$(read_file "$GL_VERSION" | head -n 1)
+    [ -n "$FIRMWARE" ] || FIRMWARE=$(jsonfilter -s "$board" -e '@.release.version' 2>/dev/null)
+    [ -f "$NETWORK" ] && [ ! -L "$NETWORK" ] || fail 'The saved network configuration could not be read safely.'
+    [ -d "$SYS_NET/eth0" ] && [ -d "$SYS_NET/eth1" ] || fail 'The expected eth0 and eth1 Ethernet interfaces were not found. No settings were changed.'
+}
+
+uci_get() { uci -q get "$1" 2>/dev/null; }
+pending_changes() { [ -n "$(uci -q changes network 2>/dev/null)" ]; }
+
+# Find br-lan by its name, never by a presumed anonymous device index.
+read_mapping() {
+    local section found=0 wan_ifname
+    BRIDGE_SECTION=
+    DEVICE_SECTIONS=$(uci -q show network 2>/dev/null | sed -n 's/^network\.\([^=]*\)=device$/\1/p')
+    for section in $DEVICE_SECTIONS; do
+        if [ "$(uci_get "network.$section.name")" = br-lan ]; then
+            found=$((found + 1))
+            BRIDGE_SECTION=$section
+        fi
+    done
+    [ "$found" = 1 ] || fail 'Exactly one br-lan bridge is required. No settings were changed.'
+    [ "$(uci_get "network.$BRIDGE_SECTION.type")" = bridge ] || fail 'The LAN device is not a bridge. No settings were changed.'
+    WAN_DEVICE=$(uci_get network.wan.device)
+    wan_ifname=$(uci_get network.wan.ifname)
+    [ -n "$WAN_DEVICE" ] || WAN_DEVICE=$wan_ifname
+    LAN_PORTS=$(uci_get "network.$BRIDGE_SECTION.ports")
+    LAN_ADDRESS=$(uci_get network.lan.ipaddr)
+    MODE=unknown
+    case " $LAN_PORTS " in
+        *' eth0 '*) HAS_ETH0=1 ;; *) HAS_ETH0=0 ;;
+    esac
+    case " $LAN_PORTS " in
+        *' eth1 '*) HAS_ETH1=1 ;; *) HAS_ETH1=0 ;;
+    esac
+    if [ "$WAN_DEVICE" = eth0 ] && [ "$HAS_ETH0" = 0 ] && [ "$HAS_ETH1" = 1 ]; then MODE=standard; fi
+    if [ "$WAN_DEVICE" = eth1 ] && [ "$HAS_ETH0" = 1 ] && [ "$HAS_ETH1" = 0 ]; then MODE=swapped; fi
+}
+
+check_layout() {
+    local section port value option wan_ifname lan_device
+    [ "$(uci_get network.wan)" = interface ] || fail 'The WAN interface is missing. No settings were changed.'
+    [ "$MODE" != unknown ] || fail 'The router uses a custom Ethernet layout. This tool needs one eth0/eth1 WAN port and the other port in br-lan.'
+    wan_ifname=$(uci_get network.wan.ifname)
+    [ -z "$wan_ifname" ] || [ "$wan_ifname" = "$WAN_DEVICE" ] || fail 'The WAN device and legacy interface name disagree. No settings were changed.'
+    lan_device=$(uci_get network.lan.device)
+    [ "$lan_device" = br-lan ] || fail 'The management LAN must use br-lan. No settings were changed.'
+    [ "$(uci_get network.lan.proto)" = static ] || fail 'The management LAN must have a fixed address. No settings were changed.'
+    [ -n "$LAN_ADDRESS" ] && [ "$(uci_get network.lan.disabled)" != 1 ] || fail 'The management LAN is disabled or has no address. No settings were changed.'
+    for section in $DEVICE_SECTIONS; do
+        [ "$section" = "$BRIDGE_SECTION" ] && continue
+        for port in $(uci_get "network.$section.ports"); do
+            case "$port" in eth0|eth1|eth0.*|eth1.*) fail 'Another bridge also uses an Ethernet port or one of its VLANs. No settings were changed.' ;; esac
+        done
+    done
+    # Additional interfaces using these physical ports can conflict with the swap.
+    for section in $(uci -q show network 2>/dev/null | sed -n 's/^network\.\([^=]*\)=interface$/\1/p'); do
+        case "$section" in wan|wan6|lan) continue ;; esac
+        for option in device ifname; do
+            value=$(uci_get "network.$section.$option")
+            for port in $value; do
+                case "$port" in eth0|eth1|eth0.*|eth1.*) fail 'Another network interface also uses an Ethernet port or one of its VLANs. No settings were changed.' ;; esac
+            done
+        done
+    done
+}
+
+json_value() { jsonfilter -s "$1" -e "$2" 2>/dev/null; }
+read_runtime() {
+    LAN_RUNTIME=$(ubus -t 3 call network.interface.lan status 2>/dev/null)
+    WAN_RUNTIME=$(ubus -t 3 call network.interface.wan status 2>/dev/null)
+    LAN_UP=$(json_value "$LAN_RUNTIME" '@.up')
+    WAN_UP=$(json_value "$WAN_RUNTIME" '@.up')
+    RUNTIME_WAN_DEVICE=$(json_value "$WAN_RUNTIME" '@.device')
+    RUNTIME_LAN_DEVICE=$(json_value "$LAN_RUNTIME" '@.device')
+    RUNTIME_LAN_ADDRESS=$(json_value "$LAN_RUNTIME" '@["ipv4-address"][0].address')
+    WAN_ADDRESS=$(json_value "$WAN_RUNTIME" '@["ipv4-address"][0].address')
+}
+
+add_link() {
+    local carrier speed
+    carrier=$(read_file "$SYS_NET/$1/carrier")
+    speed=$(read_file "$SYS_NET/$1/speed")
+    json_add_object "$1"
+    if [ "$carrier" = 1 ]; then json_add_boolean connected 1; else json_add_boolean connected 0; fi
+    case "$speed" in
+        ''|*[!0-9]*) json_add_null speed_mbps ;;
+        *) json_add_int speed_mbps "$speed" ;;
+    esac
+    json_close_object
+}
+
+uptime_seconds() {
+    local value
+    value=$(cut -d . -f 1 "$UPTIME_FILE" 2>/dev/null)
+    case "$value" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s' "$value"
+}
+
+remaining_time() {
+    local deadline now remaining
+    deadline=$(read_file "$PENDING/deadline")
+    case "$deadline" in ''|*[!0-9]*) printf 0; return ;; esac
+    now=$(uptime_seconds) || { printf 0; return; }
+    if [ "$deadline" -gt "$now" ]; then
+        remaining=$((deadline - now))
+        # A reboot or damaged journal must never create a longer watchdog.
+        [ "$remaining" -le "$ROLLBACK_SECONDS" ] || remaining=$ROLLBACK_SECONDS
+        printf '%s' "$remaining"
+    else
+        printf 0
+    fi
+}
+
+emit_status() {
+    local port token backup
+    read_runtime
+    token=$(read_file "$PENDING/token")
+    valid_token "$token" || token=
+    json_init
+    json_add_boolean ok 1
+    json_add_string model "$MODEL"
+    json_add_string firmware "$FIRMWARE"
+    json_add_string mode "$MODE"
+    json_add_string wan_device "$WAN_DEVICE"
+    json_add_array lan_ports
+    for port in $LAN_PORTS; do json_add_string '' "$port"; done
+    json_close_array
+    json_add_string lan_address "$LAN_ADDRESS"
+    json_add_string wan_address "$WAN_ADDRESS"
+    if [ "$LAN_UP" = true ]; then json_add_boolean lan_up 1; else json_add_boolean lan_up 0; fi
+    if [ "$WAN_UP" = true ]; then json_add_boolean wan_up 1; else json_add_boolean wan_up 0; fi
+    add_link eth0
+    add_link eth1
+    json_add_string pending_token "$token"
+    if [ -n "$token" ]; then
+        json_add_string pending_mode "$(read_file "$PENDING/mode")"
+        json_add_int rollback_remaining "$(remaining_time)"
+        json_add_string backup_id "$(read_file "$PENDING/backup")"
+    else
+        json_add_string pending_mode ''
+        json_add_int rollback_remaining 0
+        json_add_string backup_id "$(read_file "$STATE/last-backup")"
+    fi
+    json_add_string last_result "$(read_file "$STATE/last-result")"
+    json_add_array backups
+    if [ -d "$BACKUPS" ]; then
+        for backup in $(ls -1 "$BACKUPS" 2>/dev/null | sort -r); do
+            valid_backup "$backup" && [ -f "$BACKUPS/$backup/network" ] && json_add_string '' "$backup"
+        done
+    fi
+    json_close_array
+    json_dump
+}
+
+new_token() { hexdump -n 16 -e '16/1 "%02x"' /dev/urandom 2>/dev/null; }
+
+remove_backup() {
+    valid_backup "$1" || return
+    [ -d "$BACKUPS/$1" ] && [ ! -L "$BACKUPS/$1" ] || return
+    rm -f "$BACKUPS/$1/network" "$BACKUPS/$1/mode"
+    rmdir "$BACKUPS/$1" 2>/dev/null
+}
+
+prune_backups() {
+    local backup count=0 protected
+    protected=$(read_file "$PENDING/backup")
+    for backup in $(ls -1 "$BACKUPS" 2>/dev/null | sort -r); do
+        valid_backup "$backup" || continue
+        [ -d "$BACKUPS/$backup" ] && [ ! -L "$BACKUPS/$backup" ] || continue
+        count=$((count + 1))
+        if [ "$count" -gt 5 ] && [ "$backup" != "$protected" ]; then
+            # Only remove the files this application owns; never recurse into an
+            # unexpected directory or delete files belonging to another program.
+            remove_backup "$backup"
+        fi
+    done
+}
+
+remove_pending() {
+    [ -d "$PENDING" ] && [ ! -L "$PENDING" ] || return
+    rm -f "$PENDING/token" "$PENDING/mode" "$PENDING/wan" "$PENDING/lan" \
+        "$PENDING/backup" "$PENDING/deadline" "$PENDING/ready" "$PENDING/reload-started" \
+        "$PENDING/pid" "$PENDING/armed" "$PENDING/delta/network"
+    rmdir "$PENDING/delta" 2>/dev/null
+    rmdir "$PENDING" 2>/dev/null
+}
+
+detach_reload() {
+    # Ignore HUP before forking. BusyBox routers need neither nohup nor setsid.
+    trap '' HUP
+    (sleep 2; "$NETWORK_INIT" reload) </dev/null >/dev/null 2>&1 &
+    trap 'exit 129' HUP
+}
+
+restore_pending_backup() {
+    local backup temporary reload="${1:-yes}"
+    backup=$(read_file "$PENDING/backup")
+    valid_backup "$backup" || fail 'The rollback record is damaged. Restore the network backup manually.'
+    [ -f "$BACKUPS/$backup/network" ] && [ ! -L "$BACKUPS/$backup/network" ] || fail 'The rollback backup is missing. Restore the network configuration manually.'
+    temporary="${NETWORK}.port-switch-$$"
+    cp "$BACKUPS/$backup/network" "$temporary" && chmod 600 "$temporary" && mv "$temporary" "$NETWORK" || {
+        rm -f "$temporary"
+        fail 'The original network settings could not be restored. The saved backup is still available.'
+    }
+    printf '%s\n' "$backup" > "$STATE/last-backup"
+    printf '%s\n' rolled_back > "$STATE/last-result"
+    remove_pending
+    prune_backups
+    [ "$reload" = no ] || detach_reload
+    RESTORED_BACKUP=$backup
+}
+
+apply_mode() {
+    local target="$1" token backup old_wan port new_ports= option value now tries=0
+    case "$target" in standard) TARGET_WAN=eth0; TARGET_LAN=eth1 ;; swapped) TARGET_WAN=eth1; TARGET_LAN=eth0 ;; *) fail 'Choose either standard or swapped port roles.' ;; esac
+    prepare_state
+    [ ! -e "$PENDING" ] || fail 'A port change is awaiting confirmation. Keep or undo that change first.'
+    pending_changes && fail 'There are unsaved network changes in the router admin page. Save or discard them before switching ports.'
+    read_mapping
+    check_layout
+    now=$(uptime_seconds) || fail 'The router uptime could not be read. No settings were changed.'
+    if [ "$MODE" = "$target" ]; then
+        json_init
+        json_add_boolean ok 1
+        json_add_boolean unchanged 1
+        json_add_string token ''
+        json_add_string mode "$target"
+        json_add_string message 'These port roles are already selected.'
+        json_dump
+        return
+    fi
+    token=$(new_token)
+    valid_token "$token" || fail 'A secure change token could not be created. No settings were changed.'
+    backup="$(date -u +%Y%m%dT%H%M%SZ)-$(printf '%s' "$token" | cut -c 1-8)"
+    mkdir "$BACKUPS/$backup" || fail 'A backup could not be created. No settings were changed.'
+    if ! { cp "$NETWORK" "$BACKUPS/$backup/network" && chmod 600 "$BACKUPS/$backup/network" && printf '%s\n' "$MODE" > "$BACKUPS/$backup/mode"; }; then
+        remove_backup "$backup"
+        fail 'The network backup could not be saved. No settings were changed.'
+    fi
+    if ! { mkdir "$PENDING" && mkdir "$PENDING/delta"; }; then
+        remove_pending
+        fail 'The change record could not be created. No settings were changed.'
+    fi
+    if ! {
+        printf '%s\n' "$token" > "$PENDING/token" &&
+        printf '%s\n' "$target" > "$PENDING/mode" &&
+        printf '%s\n' "$TARGET_WAN" > "$PENDING/wan" &&
+        printf '%s\n' "$TARGET_LAN" > "$PENDING/lan" &&
+        printf '%s\n' "$backup" > "$PENDING/backup" &&
+        printf '%s\n' "$((now + ROLLBACK_SECONDS))" > "$PENDING/deadline"
+    }; then
+        remove_pending
+        fail 'The change record could not be saved. No settings were changed.'
+    fi
+    old_wan=$WAN_DEVICE
+    for port in $LAN_PORTS; do
+        case "$port" in eth0|eth1) continue ;; esac
+        new_ports="${new_ports}${new_ports:+ }$port"
+    done
+    new_ports="${new_ports}${new_ports:+ }$TARGET_LAN"
+
+    # Stage changes in a private UCI delta directory. No other package or global
+    # unsaved UCI changes are committed or reverted.
+    uci -q -t "$PENDING/delta" delete "network.$BRIDGE_SECTION.ports" || {
+        remove_pending
+        fail 'The LAN bridge could not be prepared. No settings were changed.'
+    }
+    for port in $new_ports; do
+        uci -q -t "$PENDING/delta" add_list "network.$BRIDGE_SECTION.ports=$port" || {
+            remove_pending
+            fail 'The LAN port list could not be prepared. No settings were changed.'
+        }
+    done
+    uci -q -t "$PENDING/delta" set "network.wan.device=$TARGET_WAN" || {
+        remove_pending
+        fail 'The WAN port could not be prepared. No settings were changed.'
+    }
+    if [ "$(uci_get network.wan.ifname)" = "$old_wan" ]; then
+        uci -q -t "$PENDING/delta" set "network.wan.ifname=$TARGET_WAN" || {
+            remove_pending
+            fail 'The legacy WAN port could not be prepared. No settings were changed.'
+        }
+    fi
+    for option in device ifname; do
+        value=$(uci_get "network.wan6.$option")
+        if [ "$value" = "$old_wan" ]; then
+            uci -q -t "$PENDING/delta" set "network.wan6.$option=$TARGET_WAN" || {
+                remove_pending
+                fail 'The IPv6 WAN port could not be prepared. No settings were changed.'
+            }
+        fi
+    done
+    # Refuse a concurrent admin-page change made after the first check.
+    if pending_changes || ! cmp -s "$NETWORK" "$BACKUPS/$backup/network"; then
+        remove_pending
+        fail 'The network settings changed while this request was being prepared. No settings were changed by this tool; please refresh and retry.'
+    fi
+    trap '' HUP
+    "$SELF" _worker "$token" </dev/null >/dev/null 2>&1 &
+    worker_pid=$!
+    trap 'exit 129' HUP
+    printf '%s\n' "$worker_pid" > "$PENDING/pid"
+    # An alive PID alone does not prove the helper started correctly. Require a
+    # token handshake written by the independent watchdog before committing.
+    while [ "$(read_file "$PENDING/armed")" != "$token" ] && [ "$tries" -lt 4 ]; do
+        kill -0 "$worker_pid" 2>/dev/null || break
+        sleep 1
+        tries=$((tries + 1))
+    done
+    if [ "$(read_file "$PENDING/armed")" != "$token" ] || ! kill -0 "$worker_pid" 2>/dev/null; then
+        remove_pending
+        fail 'The automatic rollback timer could not be started. No settings were changed.'
+    fi
+    # The watchdog already exists before any saved setting can change.
+    if ! uci -q -t "$PENDING/delta" commit network; then
+        restore_pending_backup
+        fail 'The port change could not be saved. The original network settings have been restored.'
+    fi
+    # Check the saved configuration through an ordinary, fresh UCI read. A
+    # successful exit code is not sufficient: some CLI options suppress commits.
+    if [ "$(uci_get network.wan.device)" != "$TARGET_WAN" ] ||
+       [ "$(uci_get "network.$BRIDGE_SECTION.ports")" != "$new_ports" ]; then
+        restore_pending_backup
+        fail 'The router did not save the requested Ethernet roles. The original network settings have been restored.'
+    fi
+    if ! : > "$PENDING/ready"; then
+        restore_pending_backup
+        fail 'The port change record could not be completed. The original network settings have been restored.'
+    fi
+    prune_backups
+    json_init
+    json_add_boolean ok 1
+    json_add_string token "$token"
+    json_add_string mode "$target"
+    json_add_int rollback_seconds "$ROLLBACK_SECONDS"
+    json_add_string backup_id "$backup"
+    json_dump
+}
+
+confirm_change() {
+    local token="$1" target wan lan backup
+    valid_token "$token" || fail 'The change token is invalid. Refresh the page and try again.'
+    token_matches "$token" || fail 'That port change is no longer pending. Refresh the page to see the current roles.'
+    [ "$(remaining_time)" -gt 0 ] || fail 'The confirmation time has expired. The router will restore the previous roles.'
+    [ -f "$PENDING/ready" ] && [ -f "$PENDING/reload-started" ] || fail 'The network is still applying the change. Wait a few seconds and try again.'
+    pending_changes && fail 'There are new unsaved network changes. The port change cannot be confirmed yet.'
+    target=$(read_file "$PENDING/mode")
+    wan=$(read_file "$PENDING/wan")
+    lan=$(read_file "$PENDING/lan")
+    backup=$(read_file "$PENDING/backup")
+    case "$target:$wan:$lan" in standard:eth0:eth1|swapped:eth1:eth0) ;; *) fail 'The pending change record is invalid. The previous roles will be restored.' ;; esac
+    read_mapping
+    check_layout
+    [ "$MODE" = "$target" ] || fail 'The saved Ethernet roles do not match the requested change. The previous roles will be restored.'
+    read_runtime
+    [ "$LAN_UP" = true ] && [ "$RUNTIME_LAN_DEVICE" = br-lan ] && [ -n "$RUNTIME_LAN_ADDRESS" ] && [ "$RUNTIME_LAN_ADDRESS" = "$LAN_ADDRESS" ] || fail 'The management LAN is not ready. Wait a few seconds before keeping these roles.'
+    [ "$RUNTIME_WAN_DEVICE" = "$wan" ] || fail 'The running WAN interface has not moved to the selected port yet. Wait a few seconds and try again.'
+    [ -d "$SYS_NET/br-lan/brif/$lan" ] && [ ! -e "$SYS_NET/br-lan/brif/$wan" ] || fail 'The running LAN bridge does not have the expected Ethernet port. The previous roles will be restored.'
+    [ "$(remaining_time)" -gt 0 ] || fail 'The confirmation time has expired. The router will restore the previous roles.'
+    printf '%s\n' "$backup" > "$STATE/last-backup"
+    printf '%s\n' confirmed > "$STATE/last-result"
+    # Removing the matching journal cancels the watchdog without ever killing a
+    # possibly reused PID. Every watchdog checks its random token before acting.
+    remove_pending
+    prune_backups
+    json_init
+    json_add_boolean ok 1
+    json_add_string message 'The new port roles are saved and verified.'
+    json_add_string backup_id "$backup"
+    json_dump
+}
+
+rollback_change() {
+    valid_token "$1" || fail 'The change token is invalid. Refresh the page and try again.'
+    token_matches "$1" || fail 'That port change is no longer pending. Refresh the page to see the current roles.'
+    restore_pending_backup
+    json_init
+    json_add_boolean ok 1
+    json_add_string message 'The previous port roles have been restored. Reconnect in a few seconds.'
+    json_add_string backup_id "$RESTORED_BACKUP"
+    json_dump
+}
+
+watchdog() {
+    local token="$1" wait_seconds
+    valid_token "$token" || exit 1
+    token_matches "$token" || exit 0
+    printf '%s\n' "$token" > "$PENDING/armed" || exit 1
+    # Reload is a separate child so a stuck init script cannot stop rollback.
+    trap '' HUP
+    "$SELF" _reload "$token" </dev/null >/dev/null 2>&1 &
+    wait_seconds=$(remaining_time)
+    [ "$wait_seconds" -gt 0 ] && sleep "$wait_seconds"
+    acquire_lock 35
+    token_matches "$token" || exit 0
+    prepare_state
+    restore_pending_backup
+}
+
+delayed_reload() {
+    local token="$1" tries=0
+    valid_token "$token" || exit 1
+    sleep 3
+    # A request interrupted before the commit must not trigger a network reload.
+    while token_matches "$token" && [ ! -f "$PENDING/ready" ] && [ "$tries" -lt 10 ]; do
+        sleep 1
+        tries=$((tries + 1))
+    done
+    acquire_lock
+    token_matches "$token" && [ -f "$PENDING/ready" ] || exit 0
+    : > "$PENDING/reload-started"
+    release_lock
+    "$NETWORK_INIT" reload >/dev/null 2>&1
+}
+
+recover_at_boot() {
+    local raw_model token
+    [ "$(id -u)" = 0 ] || fail 'This tool must be run by the router administrator.'
+    [ -e "$PENDING" ] || return 0
+    raw_model=$(read_file "$MODEL_FILE")
+    [ -n "$raw_model" ] || raw_model=$(read_file "$SYSINFO_MODEL")
+    check_model "$raw_model"
+    acquire_lock 35
+    prepare_state
+    token=$(read_file "$PENDING/token")
+    valid_token "$token" || fail 'The pending change record is damaged. Restore the network backup manually.'
+    # This boot hook runs before networking starts. Restore an unconfirmed saved
+    # change directly; normal startup will then bring up the original roles.
+    restore_pending_backup no
+}
+
+case "${1-}" in
+    _worker)
+        [ "$#" = 2 ] && [ "$(id -u)" = 0 ] || exit 1
+        watchdog "$2"
+        ;;
+    _reload)
+        [ "$#" = 2 ] && [ "$(id -u)" = 0 ] || exit 1
+        delayed_reload "$2"
+        ;;
+    status)
+        [ "$#" = 1 ] || fail 'This command does not take any extra arguments.'
+        check_router
+        acquire_lock
+        read_mapping
+        emit_status
+        ;;
+    apply)
+        [ "$#" = 2 ] || fail 'Choose either standard or swapped port roles.'
+        check_router
+        acquire_lock
+        apply_mode "$2"
+        ;;
+    confirm)
+        [ "$#" = 2 ] || fail 'A change token is required.'
+        check_router
+        acquire_lock
+        confirm_change "$2"
+        ;;
+    rollback)
+        [ "$#" = 2 ] || fail 'A change token is required.'
+        check_router
+        acquire_lock
+        rollback_change "$2"
+        ;;
+    recover)
+        [ "$#" = 1 ] || fail 'This command does not take any extra arguments.'
+        recover_at_boot
+        ;;
+    *) fail 'Use status, apply standard, apply swapped, confirm TOKEN, rollback TOKEN, or recover.' ;;
+esac
